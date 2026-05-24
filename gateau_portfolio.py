@@ -23,6 +23,12 @@ import requests
 
 warnings.filterwarnings("ignore")
 
+# Pandas display optimization
+pd.set_option("display.max_rows", 100)
+pd.set_option("display.max_columns", 20)
+pd.set_option("display.width", 220)
+pd.set_option("display.float_format", "{:.4f}".format)
+
 # =================== SYSTEM CONFIG ===================
 CONFIG = {
     # Universe
@@ -31,11 +37,11 @@ CONFIG = {
     "min_atr_pct": 0.04,
     "max_atr_pct": 0.15,
     # Tightness (quallamaggie VCP)
-    "tight_ratio": 0.8,
+    "tight_ratio": 0.8,                   # 3-day range <= 0.8 * ATR20 (compressed)
     "tight_lookback": "60d",
     # Anticipation setup (Stockbee/JLaw)
     "atr_period": 14,
-    "tight_pct_threshold": 1.5,
+    "tight_pct_threshold": 1.5,           # |Close-Open|/Open% <= 1.5% for tight day
     "min_tight_days": 2,
     "max_tight_days": 3,
     "vol_ratio_threshold": 0.8,
