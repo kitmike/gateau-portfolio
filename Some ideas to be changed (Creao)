@@ -1,0 +1,850 @@
+# ================================================================
+# ML-BASED STOCK SELECTION SYSTEM FOR SHORT-TERM TRADING
+# ================================================================
+# Strategy  : Long top-N / Short bottom-N stocks, weekly rebalance
+# Model     : LightGBM regressor (cross-sectional rank target)
+# Hold      : 5 trading days
+# Universe  : S&P 500 (configurable, default 100 stocks)
+# Validated : Walk-forward expanding-window cross-validation
+# Optimised : float32 throughout, chunked downloads, parquet cache
+# Compatible: Google Colab · Python 3.9+ · yfinance 1.x
+# ================================================================
+
+# ── 0. INSTALL ──────────────────────────────────────────────────────────────
+import subprocess, sys
+
+def _pip(pkg: str) -> None:
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "-q", pkg],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+for _pkg in ("yfinance", "lightgbm", "ta", "pyarrow", "lxml"):
+    _pip(_pkg)
+
+# ── 1. IMPORTS ──────────────────────────────────────────────────────────────
+import gc, os, warnings, time
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import lightgbm as lgb
+import ta
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from scipy.stats import spearmanr
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+warnings.filterwarnings("ignore")
+pd.options.mode.chained_assignment = None
+
+# ── 2. CONFIGURATION ────────────────────────────────────────────────────────
+CFG: Dict = dict(
+    # Universe
+    n_stocks          = 100,       # Stocks from S&P 500 (reduce to 50 for speed)
+    # Data
+    start_date        = "2018-01-01",
+    end_date          = datetime.today().strftime("%Y-%m-%d"),
+    cache_file        = "ohlcv_cache.parquet",
+    download_chunk    = 25,        # Tickers per yfinance batch (RAM control)
+    min_trading_days  = 750,       # ~3 years minimum history
+    # Features
+    fast_ma           = 10,
+    slow_ma           = 30,
+    rsi_period        = 14,
+    bb_period         = 20,
+    atr_period        = 14,
+    vol_lookback      = 20,
+    # Target
+    forward_days      = 5,         # Predict 5-day forward return
+    # Walk-forward CV
+    train_years       = 2,         # Minimum training window (expanding)
+    val_months        = 3,         # OOS validation window per fold
+    n_folds           = 4,         # Number of walk-forward folds
+    # Portfolio
+    top_n             = 10,        # Long top-N ranked stocks
+    bottom_n          = 0,         # Short bottom-N (0 = long-only)
+    rebal_freq        = 5,         # Rebalance every N trading days
+    transaction_cost  = 0.001,     # 0.10% per trade (one-way)
+    max_weight        = 0.10,      # Max weight per position
+    # Model hyperparameters
+    lgb_params = dict(
+        objective         = "regression",
+        metric            = "rmse",
+        n_estimators      = 400,
+        learning_rate     = 0.04,
+        num_leaves        = 31,
+        min_child_samples = 40,
+        subsample         = 0.8,
+        colsample_bytree  = 0.8,
+        reg_alpha         = 0.1,
+        reg_lambda        = 0.2,
+        n_jobs            = -1,
+        verbosity         = -1,
+        random_state      = 42,
+    ),
+)
+
+FEATURE_COLS: List[str] = [
+    "ret_1d", "ret_5d", "ret_10d", "ret_20d",
+    "ma_cross", "price_vs_ma20",
+    "rsi", "macd_hist",
+    "bb_position", "bb_width",
+    "atr_pct", "vol_ratio",
+    "gap_open", "high_low_range",
+    "vol_z", "ret_vol",
+    "close_vs_high20", "close_vs_low20",
+    "volume_trend",
+]
+
+
+# ── 3. UNIVERSE ─────────────────────────────────────────────────────────────
+def get_sp500_tickers(n: int) -> List[str]:
+    """Fetch S&P 500 tickers from Wikipedia; fall back to hardcoded list."""
+    priority = [
+        "AAPL","MSFT","AMZN","GOOGL","META","NVDA","TSLA","JPM","JNJ","V",
+        "UNH","XOM","WMT","MA","HD","CVX","LLY","ABBV","AVGO","PG","MRK",
+        "COST","KO","PEP","TMO","MCD","ACN","NKE","ADBE","CRM","BAC","NFLX",
+        "ORCL","LIN","PM","TXN","DHR","AMD","QCOM","HON","UNP","INTU","IBM",
+        "RTX","AMGN","LOW","CAT","GS","SBUX","BLK","SPGI","DE","AXP","MDLZ",
+        "ADI","ISRG","VRTX","T","MO","GILD","C","MS","MMC","PLD","SYK","ETN",
+        "ZTS","CB","CI","SO","DUK","CCI","NOC","GD","BSX","TJX","MMM","USB",
+        "PNC","ICE","AON","EMR","COF","APD","MPC","PSX","FCX","SHW","KLAC",
+        "LRCX","AMAT","MU","SNPS","CDNS","MCHP","NXPI","ON","TER","MPWR",
+    ]
+    try:
+        tables = pd.read_html(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+            flavor="lxml",
+        )
+        wiki = tables[0]["Symbol"].tolist()
+        wiki = [t.replace(".", "-") for t in wiki if "/" not in t and "." not in t]
+        ordered = priority + [t for t in wiki if t not in priority]
+        print(f"✅ Loaded {len(wiki)} S&P 500 tickers from Wikipedia")
+    except Exception as e:
+        print(f"⚠  Wikipedia fetch failed ({e}). Using fallback list.")
+        ordered = priority
+    return ordered[:n]
+
+
+# ── 4. DATA DOWNLOAD (chunked + cached) ─────────────────────────────────────
+def download_ohlcv(tickers: List[str], cfg: Dict) -> pd.DataFrame:
+    """
+    Download OHLCV in small chunks to limit peak RAM.
+    yfinance >=1.0 always returns MultiIndex columns (field, ticker).
+    Caches to Parquet for fast subsequent runs.
+    """
+    cache = cfg["cache_file"]
+    if os.path.exists(cache):
+        print(f"✅ Cache found → loading {cache}")
+        df = pd.read_parquet(cache)
+        print(f"   {df['ticker'].nunique()} tickers, {len(df):,} rows")
+        return df
+
+    print(f"📥 Downloading {len(tickers)} tickers in chunks of {cfg['download_chunk']} …")
+    chunks: List[pd.DataFrame] = []
+    n_chunks = -(-len(tickers) // cfg["download_chunk"])   # ceiling division
+
+    for i in range(0, len(tickers), cfg["download_chunk"]):
+        batch    = tickers[i : i + cfg["download_chunk"]]
+        chunk_no = i // cfg["download_chunk"] + 1
+        print(f"  [{chunk_no:2d}/{n_chunks}] {batch[:3]}… ", end="", flush=True)
+
+        try:
+            raw = yf.download(
+                batch,
+                start    = cfg["start_date"],
+                end      = cfg["end_date"],
+                auto_adjust = True,   # OHLCV adjusted; no separate Adj Close
+                progress    = False,
+            )
+        except Exception as exc:
+            print(f"download error: {exc}")
+            gc.collect()
+            continue
+
+        if raw.empty:
+            print("empty, skipping")
+            gc.collect()
+            continue
+
+        # yfinance 1.x always returns MultiIndex (field, ticker),
+        # even for a single ticker.
+        raw.columns.names = ["field", "ticker"]
+
+        try:
+            long = raw.stack(level="ticker", future_stack=True).reset_index()
+        except TypeError:
+            # pandas < 2.1 does not support future_stack keyword
+            long = raw.stack(level="ticker").reset_index()
+
+        long.columns.name = None
+
+        # Lowercase all column names
+        long.columns = [str(c).lower() for c in long.columns]
+
+        # yfinance sometimes names the date column 'price' in v1.x – fix it
+        for alias in ("price", "level_0", "index"):
+            if alias in long.columns and "date" not in long.columns:
+                long = long.rename(columns={alias: "date"})
+
+        needed  = {"date", "ticker", "open", "high", "low", "close", "volume"}
+        missing = needed - set(long.columns)
+        if missing:
+            print(f"⚠  missing cols {missing}, skipping chunk")
+            gc.collect()
+            continue
+
+        long = long[sorted(needed)].copy()
+        long["date"] = pd.to_datetime(long["date"]).dt.tz_localize(None)
+
+        # Coerce and downcast to float32
+        for col in ("open", "high", "low", "close"):
+            long[col] = pd.to_numeric(long[col], errors="coerce").astype(np.float32)
+        long["volume"] = pd.to_numeric(long["volume"], errors="coerce").astype(np.float32)
+
+        # Drop rows where close is NaN (weekend artefacts after stack)
+        long = long.dropna(subset=["close"])
+
+        chunks.append(long)
+        print(f"✓ {len(long):,} rows")
+        gc.collect()
+
+    if not chunks:
+        raise RuntimeError("No data downloaded. Check internet connection.")
+
+    df = pd.concat(chunks, ignore_index=True)
+    df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
+
+    # Keep only tickers with sufficient history
+    counts = df.groupby("ticker")["date"].count()
+    valid  = counts[counts >= cfg["min_trading_days"]].index
+    df     = df[df["ticker"].isin(valid)].copy()
+    print(f"\n✅ Final: {df['ticker'].nunique()} tickers, {len(df):,} rows")
+
+    df.to_parquet(cache, index=False)
+    return df
+
+
+# ── 5. FEATURE ENGINEERING ──────────────────────────────────────────────────
+def _features_for_ticker(sub: pd.DataFrame, cfg: Dict) -> Optional[pd.DataFrame]:
+    """
+    Compute all predictive features for one ticker.
+    Input: DataFrame indexed by date with OHLCV columns.
+    Returns None when the ticker has insufficient history.
+    """
+    c = sub["close"].astype(float)
+    h = sub["high"].astype(float)
+    l = sub["low"].astype(float)
+    o = sub["open"].astype(float)
+    v = sub["volume"].astype(float)
+
+    if len(c) < cfg["slow_ma"] + 10:
+        return None
+
+    t   = sub.copy()
+    fwd = cfg["forward_days"]
+
+    # ── Multi-horizon price momentum ────────────────────────
+    t["ret_1d"]  = c.pct_change(1)
+    t["ret_5d"]  = c.pct_change(5)
+    t["ret_10d"] = c.pct_change(10)
+    t["ret_20d"] = c.pct_change(20)
+
+    # ── MA crossover + price vs MA ───────────────────────────
+    ma_fast = c.rolling(cfg["fast_ma"]).mean()
+    ma_slow = c.rolling(cfg["slow_ma"]).mean()
+    t["ma_cross"]      = (ma_fast / (ma_slow + 1e-9)) - 1.0
+    t["price_vs_ma20"] = (c / (ma_slow + 1e-9)) - 1.0
+
+    # ── RSI (normalised to [-1, +1]) ─────────────────────────
+    rsi_raw   = ta.momentum.RSIIndicator(c, window=cfg["rsi_period"]).rsi()
+    t["rsi"]  = (rsi_raw - 50.0) / 50.0
+
+    # ── MACD histogram (price-normalised) ────────────────────
+    macd_obj       = ta.trend.MACD(c, window_slow=26, window_fast=12, window_sign=9)
+    t["macd_hist"] = macd_obj.macd_diff() / (c.abs() + 1e-9)
+
+    # ── Bollinger Bands ──────────────────────────────────────
+    bb        = ta.volatility.BollingerBands(c, window=cfg["bb_period"])
+    bb_upper  = bb.bollinger_hband()
+    bb_lower  = bb.bollinger_lband()
+    bb_mid    = bb.bollinger_mavg()
+    band_w    = (bb_upper - bb_lower).clip(lower=1e-9)
+    # bb_position: -0.5 = at lower band, +0.5 = at upper band
+    t["bb_position"] = ((c - bb_lower) / band_w) - 0.5
+    t["bb_width"]    = band_w / (bb_mid.abs() + 1e-9)
+
+    # ── ATR (% of close) ─────────────────────────────────────
+    atr        = ta.volatility.AverageTrueRange(h, c, l,
+                     window=cfg["atr_period"]).average_true_range()
+    t["atr_pct"] = atr / (c.abs() + 1e-9)
+
+    # ── Volume ratio vs rolling mean ─────────────────────────
+    v_ma          = v.rolling(cfg["vol_lookback"]).mean()
+    t["vol_ratio"] = v / (v_ma + 1e-9)
+
+    # ── Overnight gap ────────────────────────────────────────
+    t["gap_open"] = (o / (c.shift(1) + 1e-9)) - 1.0
+
+    # ── Intraday range ───────────────────────────────────────
+    t["high_low_range"] = (h - l) / (c.abs() + 1e-9)
+
+    # ── Volume z-score ───────────────────────────────────────
+    v_std      = v.rolling(cfg["vol_lookback"]).std()
+    t["vol_z"] = (v - v_ma) / (v_std + 1e-9)
+
+    # ── Realised volatility ──────────────────────────────────
+    t["ret_vol"] = c.pct_change().rolling(cfg["vol_lookback"]).std()
+
+    # ── Distance from N-day high / low ───────────────────────
+    t["close_vs_high20"] = (c / (c.rolling(20).max() + 1e-9)) - 1.0
+    t["close_vs_low20"]  = (c / (c.rolling(20).min() + 1e-9)) - 1.0
+
+    # ── Short-term vs long-term volume trend ──────────────────
+    t["volume_trend"] = (v.rolling(5).mean() / (v.rolling(20).mean() + 1e-9)) - 1.0
+
+    # ── Target: forward return (shift BACK to avoid leakage) ─
+    t["target"]    = (c.shift(-fwd) / (c + 1e-9)) - 1.0
+    t["fwd_close"] = c.shift(-fwd)
+
+    # Downcast to float32 for RAM efficiency
+    float_cols = FEATURE_COLS + ["target", "fwd_close"]
+    for col in float_cols:
+        if col in t.columns:
+            t[col] = t[col].astype(np.float32)
+
+    return t
+
+
+def compute_features(df: pd.DataFrame, cfg: Dict) -> pd.DataFrame:
+    """Apply feature engineering to every ticker; return combined DataFrame."""
+    print("⚙️  Engineering features …")
+    results: List[pd.DataFrame] = []
+    tickers = df["ticker"].unique()
+
+    for i, tkr in enumerate(tickers):
+        if i % 25 == 0:
+            print(f"   {i:3d}/{len(tickers)} tickers …", flush=True)
+
+        sub    = df[df["ticker"] == tkr].copy().sort_values("date").set_index("date")
+        result = _features_for_ticker(sub, cfg)
+        if result is None:
+            continue
+
+        result         = result.reset_index()
+        result["ticker"] = tkr
+        results.append(result)
+
+        del sub, result
+        gc.collect()
+
+    out = pd.concat(results, ignore_index=True)
+    print(f"✅ Features ready: {out.shape[0]:,} rows × {out.shape[1]} cols")
+    return out
+
+
+# ── 6. CROSS-SECTIONAL RANK TARGET ──────────────────────────────────────────
+def add_rank_target(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Replace raw forward return with its cross-sectional rank percentile [0,1].
+    This removes market-beta from the label and stabilises training.
+    """
+    df = df.copy()
+    df["target_rank"] = (
+        df.groupby("date")["target"]
+          .rank(pct=True, method="average")
+          .astype(np.float32)
+    )
+    return df
+
+
+# ── 7. WALK-FORWARD CROSS-VALIDATION ────────────────────────────────────────
+def walk_forward_cv(
+    df: pd.DataFrame, cfg: Dict
+) -> Tuple[lgb.LGBMRegressor, pd.DataFrame, List[Dict]]:
+    """
+    Expanding-window walk-forward CV.
+    Each fold: train on all history up to val_start, validate on next val_months.
+    Returns: (final model trained on all data, OOS predictions df, fold metrics).
+    """
+    print("\n🔁 Walk-forward cross-validation …")
+
+    df = df.dropna(subset=FEATURE_COLS + ["target_rank"]).copy()
+    all_dates  = sorted(df["date"].unique())
+    total_days = len(all_dates)
+
+    min_train  = int(cfg["train_years"] * 252)
+    val_days   = int(cfg["val_months"]  * 21)
+
+    # Build fold cutpoints working backwards from end of data
+    fold_val_ends: List[int] = []
+    idx = total_days - 1
+    for _ in range(cfg["n_folds"]):
+        if idx - val_days < min_train:
+            break
+        fold_val_ends.append(idx)
+        idx -= val_days
+    fold_val_ends = sorted(fold_val_ends)
+
+    if not fold_val_ends:
+        raise ValueError(
+            f"Not enough data for even 1 fold. Need {min_train + val_days} days, "
+            f"have {total_days}."
+        )
+
+    oos_preds:  List[pd.DataFrame] = []
+    fold_stats: List[Dict]         = []
+
+    for fold_i, val_end_idx in enumerate(fold_val_ends):
+        val_start_idx = val_end_idx - val_days + 1
+
+        train_dates = all_dates[:val_start_idx]
+        val_dates   = all_dates[val_start_idx : val_end_idx + 1]
+
+        if len(train_dates) < min_train or len(val_dates) < 5:
+            continue
+
+        train_df = df[df["date"].isin(train_dates)]
+        val_df   = df[df["date"].isin(val_dates)]
+
+        X_tr = train_df[FEATURE_COLS].values.astype(np.float32)
+        y_tr = train_df["target_rank"].values.astype(np.float32)
+        X_va = val_df[FEATURE_COLS].values.astype(np.float32)
+        y_va = val_df["target_rank"].values.astype(np.float32)
+
+        model = lgb.LGBMRegressor(**cfg["lgb_params"])
+        model.fit(
+            X_tr, y_tr,
+            eval_set  = [(X_va, y_va)],
+            callbacks = [
+                lgb.early_stopping(stopping_rounds=50, verbose=False),
+                lgb.log_evaluation(period=-1),
+            ],
+            feature_name = FEATURE_COLS,
+        )
+
+        preds    = model.predict(X_va).astype(np.float32)
+        ic, _    = spearmanr(preds, y_va)
+        best_it  = model.best_iteration_ if model.best_iteration_ else cfg["lgb_params"]["n_estimators"]
+
+        val_out               = val_df[["date", "ticker", "target", "fwd_close"]].copy()
+        val_out["pred_rank"]  = preds
+
+        oos_preds.append(val_out)
+        fold_stats.append(dict(
+            fold       = fold_i + 1,
+            train_days = len(train_dates),
+            val_days   = len(val_dates),
+            val_start  = str(val_dates[0])[:10],
+            val_end    = str(val_dates[-1])[:10],
+            ic         = round(float(ic), 4),
+            best_iter  = best_it,
+        ))
+        print(
+            f"  Fold {fold_i+1}: train={len(train_dates):4d}d  "
+            f"val={str(val_dates[0])[:10]} → {str(val_dates[-1])[:10]}  "
+            f"IC={ic:+.4f}  best_iter={best_it}"
+        )
+
+        del X_tr, y_tr, X_va, y_va, train_df, val_df, model
+        gc.collect()
+
+    # ── Train FINAL model on ALL data ───────────────────────
+    print("\n🏋  Training final model on full dataset …")
+    X_all = df[FEATURE_COLS].values.astype(np.float32)
+    y_all = df["target_rank"].values.astype(np.float32)
+
+    # Use median best_iteration as final n_estimators (avoids overfitting)
+    best_iters = [s["best_iter"] for s in fold_stats if s["best_iter"] > 0]
+    if best_iters:
+        final_n = max(50, int(np.median(best_iters)))
+        final_params = {**cfg["lgb_params"], "n_estimators": final_n}
+        print(f"   n_estimators = {final_n} (median of fold best iters)")
+    else:
+        final_params = cfg["lgb_params"]
+
+    final_model = lgb.LGBMRegressor(**final_params)
+    final_model.fit(X_all, y_all, feature_name=FEATURE_COLS)
+
+    all_oos = pd.concat(oos_preds, ignore_index=True) if oos_preds else pd.DataFrame()
+    return final_model, all_oos, fold_stats
+
+
+# ── 8. BACKTEST ─────────────────────────────────────────────────────────────
+def backtest(oos_df: pd.DataFrame, cfg: Dict) -> pd.DataFrame:
+    """
+    Simulate the strategy on OOS predictions.
+    Rebalances every cfg['rebal_freq'] days; deducts transaction costs.
+    Each day's P&L approximated using realised forward return / rebal_freq
+    so that the holding-period return is spread across hold days.
+    Returns a DataFrame with columns ['return', 'n_longs'].
+    """
+    if oos_df.empty:
+        print("⚠  No OOS predictions — skipping backtest.")
+        return pd.DataFrame()
+
+    print("\n📊 Running backtest …")
+    oos_df = oos_df.dropna(subset=["pred_rank", "target"]).copy()
+
+    top_n  = cfg["top_n"]
+    bot_n  = cfg["bottom_n"]
+    tc     = cfg["transaction_cost"]
+    max_w  = cfg["max_weight"]
+    freq   = cfg["rebal_freq"]
+
+    all_dates   = sorted(oos_df["date"].unique())
+    rebal_dates = set(all_dates[::freq])
+
+    records: List[Dict] = []
+    prev_longs:  set    = set()
+    prev_shorts: set    = set()
+    position_w          = min(max_w, 1.0 / max(top_n, 1))
+
+    for dt in all_dates:
+        day_df = oos_df[oos_df["date"] == dt]
+        n_avail = len(day_df)
+        if n_avail < max(top_n + bot_n, 5):
+            continue
+
+        # ── Rebalance if scheduled ───────────────────────────
+        if dt in rebal_dates:
+            ranked  = day_df.sort_values("pred_rank", ascending=False)
+            new_longs  = set(ranked.head(top_n)["ticker"])
+            new_shorts = set(ranked.tail(bot_n)["ticker"]) if bot_n > 0 else set()
+
+            # Transaction costs on stocks entering/exiting
+            turnover = (
+                len(new_longs.symmetric_difference(prev_longs))
+                + len(new_shorts.symmetric_difference(prev_shorts))
+            )
+            tc_drag = turnover * position_w * tc
+        else:
+            new_longs, new_shorts, tc_drag = prev_longs, prev_shorts, 0.0
+
+        prev_longs, prev_shorts = new_longs, new_shorts
+
+        if not new_longs and not new_shorts:
+            continue
+
+        # ── Compute daily P&L ────────────────────────────────
+        day_idx = day_df.set_index("ticker")["target"]  # realised fwd return
+
+        # Daily contribution = (fwd_return / hold_period) per position
+        pnl = 0.0
+        for tkr in new_longs:
+            if tkr in day_idx.index:
+                pnl += position_w * float(day_idx[tkr]) / freq
+        for tkr in new_shorts:
+            if tkr in day_idx.index:
+                pnl -= position_w * float(day_idx[tkr]) / freq
+
+        pnl -= tc_drag
+
+        records.append({
+            "date"    : dt,
+            "return"  : pnl,
+            "n_longs" : len(new_longs),
+        })
+
+    port = pd.DataFrame(records).set_index("date")
+    port.index = pd.to_datetime(port.index)
+    print(f"✅ Backtest: {len(port)} days, "
+          f"total return = {(1+port['return']).prod()-1:.2%}")
+    return port
+
+
+# ── 9. PERFORMANCE METRICS ───────────────────────────────────────────────────
+def compute_metrics(returns: pd.Series, ann_factor: int = 252) -> Dict:
+    """Standard risk/return metrics from a daily returns series."""
+    r = returns.dropna()
+    if len(r) < 10:
+        return {"Error": "Too few observations"}
+
+    total_ret = (1 + r).prod() - 1
+    ann_ret   = (1 + total_ret) ** (ann_factor / len(r)) - 1
+    ann_vol   = r.std() * np.sqrt(ann_factor)
+    sharpe    = ann_ret / (ann_vol + 1e-9)
+    downside  = r[r < 0].std() * np.sqrt(ann_factor)
+    sortino   = ann_ret / (downside + 1e-9)
+
+    cum         = (1 + r).cumprod()
+    rolling_max = cum.cummax()
+    dd          = (cum - rolling_max) / (rolling_max + 1e-9)
+    max_dd      = dd.min()
+    calmar      = ann_ret / (abs(max_dd) + 1e-9)
+
+    hit_rate = (r > 0).mean()
+    avg_win  = r[r > 0].mean() if (r > 0).any() else 0.0
+    avg_loss = r[r < 0].mean() if (r < 0).any() else 0.0
+    win_loss = abs(avg_win / (avg_loss + 1e-9))
+
+    return {
+        "Total Return"    : f"{total_ret*100:.2f}%",
+        "Ann. Return"     : f"{ann_ret*100:.2f}%",
+        "Ann. Volatility" : f"{ann_vol*100:.2f}%",
+        "Sharpe Ratio"    : f"{sharpe:.3f}",
+        "Sortino Ratio"   : f"{sortino:.3f}",
+        "Calmar Ratio"    : f"{calmar:.3f}",
+        "Max Drawdown"    : f"{max_dd*100:.2f}%",
+        "Hit Rate"        : f"{hit_rate*100:.1f}%",
+        "Win/Loss Ratio"  : f"{win_loss:.2f}x",
+        "# Trading Days"  : len(r),
+    }
+
+
+# ── 10. VISUALISATION ────────────────────────────────────────────────────────
+def plot_results(
+    port:       pd.DataFrame,
+    fold_stats: List[Dict],
+    model:      lgb.LGBMRegressor,
+) -> None:
+    """6-panel performance dashboard."""
+    if port.empty:
+        print("No portfolio results to plot.")
+        return
+
+    r   = port["return"]
+    cum = (1 + r).cumprod()
+
+    fig, axes = plt.subplots(3, 2, figsize=(16, 14))
+    fig.suptitle(
+        "ML Stock Selection System — Out-of-Sample Performance",
+        fontsize=15, fontweight="bold", y=0.98,
+    )
+
+    # ── 1: Cumulative returns + drawdown ────────────────────
+    ax = axes[0, 0]
+    ax.plot(cum.index, cum.values, lw=2, color="#2196F3", label="Strategy")
+    ax.axhline(1, color="grey", lw=0.8, linestyle="--")
+    rolling_max = cum.cummax()
+    ax.fill_between(cum.index, cum.values, rolling_max.values,
+                    alpha=0.25, color="red", label="Drawdown")
+    ax.set_title("Cumulative Returns (OOS)", fontweight="bold")
+    ax.set_ylabel("Portfolio Value (start = 1)")
+    ax.legend(fontsize=9); ax.grid(alpha=0.3)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+    plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha="right")
+
+    # ── 2: Rolling 63-day Sharpe ────────────────────────────
+    ax = axes[0, 1]
+    roll_sh = r.rolling(63).apply(
+        lambda x: x.mean() / (x.std() + 1e-9) * np.sqrt(252), raw=True
+    )
+    ax.plot(roll_sh.index, roll_sh.values, lw=1.5, color="#4CAF50")
+    ax.axhline(0, color="grey", lw=0.8)
+    ax.axhline(1, color="#FF9800", lw=1, linestyle=":", label="Sharpe = 1")
+    ax.set_title("Rolling 63-Day Sharpe", fontweight="bold")
+    ax.set_ylabel("Sharpe")
+    ax.legend(fontsize=9); ax.grid(alpha=0.3)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+    plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha="right")
+
+    # ── 3: Monthly return heatmap ───────────────────────────
+    ax = axes[1, 0]
+    r_idx = r.copy()
+    r_idx.index = pd.to_datetime(r_idx.index)
+    monthly = r_idx.resample("ME").apply(lambda x: (1 + x).prod() - 1)
+    mdf = monthly.to_frame("ret")
+    mdf["year"]  = mdf.index.year
+    mdf["month"] = mdf.index.month
+    pivot = mdf.pivot(index="year", columns="month", values="ret")
+    month_labels = ["Jan","Feb","Mar","Apr","May","Jun",
+                    "Jul","Aug","Sep","Oct","Nov","Dec"]
+    pivot.columns = [month_labels[m - 1] for m in pivot.columns]
+    vals = pivot.values[~np.isnan(pivot.values)]
+    vmax = max(abs(vals).max(), 0.01) if len(vals) else 0.05
+    im = ax.imshow(pivot.values, cmap="RdYlGn", aspect="auto",
+                   vmin=-vmax, vmax=vmax)
+    ax.set_xticks(range(len(pivot.columns)))
+    ax.set_xticklabels(pivot.columns, fontsize=8)
+    ax.set_yticks(range(len(pivot.index)))
+    ax.set_yticklabels(pivot.index.astype(str), fontsize=8)
+    for row_i in range(len(pivot.index)):
+        for col_i in range(len(pivot.columns)):
+            v = pivot.values[row_i, col_i]
+            if not np.isnan(v):
+                txt_col = "black" if abs(v) < vmax * 0.6 else "white"
+                ax.text(col_i, row_i, f"{v*100:.1f}%", ha="center",
+                        va="center", fontsize=6.5, color=txt_col)
+    ax.set_title("Monthly Returns (%)", fontweight="bold")
+    fig.colorbar(im, ax=ax, shrink=0.8)
+
+    # ── 4: Walk-forward IC per fold ─────────────────────────
+    ax = axes[1, 1]
+    if fold_stats:
+        fnums = [s["fold"] for s in fold_stats]
+        fics  = [s["ic"]   for s in fold_stats]
+        bcols = ["#4CAF50" if ic > 0 else "#F44336" for ic in fics]
+        ax.bar(fnums, fics, color=bcols, edgecolor="white", width=0.6)
+        ax.axhline(0, color="grey", lw=0.8)
+        ax.axhline(0.05, color="#FF9800", lw=1.2, linestyle="--",
+                   label="IC = 0.05 (useful)")
+        for fn, ic in zip(fnums, fics):
+            ax.text(fn, ic + (0.004 if ic >= 0 else -0.007),
+                    f"{ic:.3f}", ha="center", fontsize=9, fontweight="bold")
+        ax.set_xticks(fnums)
+        ax.set_xticklabels(
+            [f"Fold {s['fold']}\n{s['val_start'][:7]}" for s in fold_stats],
+            fontsize=8,
+        )
+        ax.set_title("Information Coefficient (IC) per Fold", fontweight="bold")
+        ax.set_ylabel("Spearman IC")
+        ax.legend(fontsize=9)
+        ax.grid(alpha=0.3, axis="y")
+
+    # ── 5: Feature importance ───────────────────────────────
+    ax = axes[2, 0]
+    imp   = model.feature_importances_
+    names = np.array(FEATURE_COLS)
+    order = np.argsort(imp)
+    ax.barh(names[order], imp[order], color="#9C27B0", alpha=0.85)
+    ax.set_title("Feature Importance (LightGBM splits)", fontweight="bold")
+    ax.set_xlabel("Importance")
+    ax.grid(alpha=0.3, axis="x")
+
+    # ── 6: Daily return histogram ───────────────────────────
+    ax = axes[2, 1]
+    clean_r = r.dropna()
+    ax.hist(clean_r.values * 100, bins=60,
+            color="#00BCD4", edgecolor="white", alpha=0.85, density=True)
+    mean_r = clean_r.mean() * 100
+    ax.axvline(mean_r, color="red", lw=1.8, linestyle="--",
+               label=f"Mean = {mean_r:.3f}%")
+    ax.axvline(0, color="grey", lw=1.0)
+    ax.set_title("Daily Return Distribution", fontweight="bold")
+    ax.set_xlabel("Daily Return (%)")
+    ax.set_ylabel("Density")
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    os.makedirs("files", exist_ok=True)
+    out_path = os.path.join("files", "ml_stock_system_results.png")
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.show()
+    print(f"\n📈 Chart saved → {out_path}")
+
+
+# ── 11. TODAY'S SIGNALS ──────────────────────────────────────────────────────
+def generate_signals(
+    feat_df: pd.DataFrame,
+    model:   lgb.LGBMRegressor,
+    cfg:     Dict,
+) -> pd.DataFrame:
+    """
+    Score all stocks on the most recent trading date and emit ranked signals.
+    Returns a DataFrame: LONG signals at top, SHORT at bottom.
+    """
+    latest = feat_df["date"].max()
+    today  = feat_df[feat_df["date"] == latest].dropna(subset=FEATURE_COLS).copy()
+
+    if today.empty:
+        print(f"⚠  No usable data on {latest} for signals.")
+        return pd.DataFrame()
+
+    X           = today[FEATURE_COLS].values.astype(np.float32)
+    preds       = model.predict(X).astype(np.float32)
+    today       = today.copy()
+    today["pred_rank"]  = preds
+    today["signal_pct"] = (
+        pd.Series(preds, index=today.index).rank(pct=True).values
+    )
+
+    ranked  = today.sort_values("pred_rank", ascending=False).reset_index(drop=True)
+    ranked["signal"] = "  HOLD"
+    ranked.loc[ranked.index < cfg["top_n"], "signal"] = "LONG  ▲"
+    if cfg["bottom_n"] > 0:
+        ranked.loc[
+            ranked.index >= len(ranked) - cfg["bottom_n"], "signal"
+        ] = "SHORT ▼"
+
+    cols = [c for c in
+            ["ticker", "signal", "pred_rank", "signal_pct",
+             "ret_5d", "rsi", "ma_cross", "vol_ratio", "atr_pct"]
+            if c in ranked.columns]
+    out = ranked[cols].copy()
+
+    # Format floats for readability
+    for col in ["pred_rank", "signal_pct", "ret_5d", "rsi",
+                "ma_cross", "vol_ratio", "atr_pct"]:
+        if col in out.columns:
+            out[col] = out[col].map(lambda x: f"{x:+.4f}" if not pd.isna(x) else "NaN")
+
+    return out
+
+
+# ── 12. MAIN ─────────────────────────────────────────────────────────────────
+def main(cfg: Dict = CFG):
+    t0 = time.time()
+    sep = "=" * 62
+    print(sep)
+    print("  ML STOCK SELECTION SYSTEM  |  Short-Term  |  LightGBM")
+    print(f"  Universe: {cfg['n_stocks']} S&P500 stocks  "
+          f"| Hold: {cfg['forward_days']}d  "
+          f"| Long top {cfg['top_n']}"
+          + (f" / Short bot {cfg['bottom_n']}" if cfg["bottom_n"] else ""))
+    print(sep)
+
+    # 1 ── Universe
+    tickers = get_sp500_tickers(cfg["n_stocks"])
+    print(f"\n📋 Universe: {len(tickers)} tickers")
+
+    # 2 ── Download
+    raw_df = download_ohlcv(tickers, cfg)
+
+    # 3 ── Features
+    feat_df = compute_features(raw_df, cfg)
+    del raw_df; gc.collect()
+
+    # 4 ── Cross-sectional rank target
+    feat_df = add_rank_target(feat_df)
+    feat_df = feat_df.dropna(subset=["target", "target_rank"])
+    print(f"   Rows with valid target: {len(feat_df):,}")
+
+    # 5 ── Walk-forward CV + final model
+    model, oos_df, fold_stats = walk_forward_cv(feat_df, cfg)
+
+    # 6 ── Backtest
+    port = backtest(oos_df, cfg)
+
+    # 7 ── Print metrics
+    if not port.empty:
+        metrics = compute_metrics(port["return"])
+        avg_ic = float(np.mean([s["ic"] for s in fold_stats])) if fold_stats else 0.0
+        icir   = (avg_ic / (np.std([s["ic"] for s in fold_stats]) + 1e-9)
+                  if len(fold_stats) > 1 else 0.0)
+
+        print("\n" + "─" * 42)
+        print("  OUT-OF-SAMPLE PERFORMANCE METRICS")
+        print("─" * 42)
+        for k, v in metrics.items():
+            print(f"  {k:<24} {v}")
+        print(f"  {'Mean IC':<24} {avg_ic:+.4f}")
+        print(f"  {'ICIR':<24} {icir:.4f}")
+        print("─" * 42)
+
+    # 8 ── Visualise
+    plot_results(port, fold_stats, model)
+
+    # 9 ── Today's signals
+    signals = generate_signals(feat_df, model, cfg)
+    if not signals.empty:
+        n_show = cfg["top_n"] + cfg["bottom_n"] + 1
+        print(f"\n🎯  SIGNALS AS OF {feat_df['date'].max().date()}")
+        print("─" * 62)
+        # Show only LONG + SHORT rows
+        actionable = signals[signals["signal"].str.strip().isin(["LONG  ▲", "SHORT ▼"])]
+        print(actionable.to_string(index=True))
+        print("─" * 62)
+
+    elapsed = time.time() - t0
+    print(f"\n✅ Completed in {elapsed:.1f}s")
+    return model, feat_df, port, signals
+
+
+# ── ENTRY POINT ──────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    model, feat_df, port, signals = main(CFG)

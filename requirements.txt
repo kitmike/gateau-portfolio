@@ -1,0 +1,7 @@
+yfinance>=0.2.32
+pandas>=2.0.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+curl-cffi>=0.5.9
+tqdm>=4.65.0
+requests>=2.31.0
